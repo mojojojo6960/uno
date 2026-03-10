@@ -124,73 +124,80 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: 📦 Install Release Tools
+      - name: 📦 Install Tools
         run: |
-          $tmp="$env:TEMP"
+          Write-Host "Creating installation directory..."
+          $installDir = "$env:USERPROFILE\Tools"
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
           
-          # Function to download and verify
-          function Safe-Install {
-            param($Url, $OutFile, $Args)
+          # Function to download and install
+          function Install-Tool {
+            param(
+              [string]$Name,
+              [string]$Url,
+              [string]$InstallerArgs = "/S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-",
+              [bool]$IsMsi = $false
+            )
             
-            Write-Host "Downloading from: $Url"
+            Write-Host "Installing $Name..."
+            $ext = if ($IsMsi) { ".msi" } else { ".exe" }
+            $installer = "$env:TEMP\$Name$ext"
             
-            # Download with retry
-            $retries = 3
-            while ($retries -gt 0) {
-              try {
-                Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
-                Write-Host "Downloaded to: $OutFile"
-                break
-              } catch {
-                $retries--
-                Write-Host "Download failed, retries left: $retries"
-                if ($retries -eq 0) { throw }
-                Start-Sleep -Seconds 2
+            try {
+              Invoke-WebRequest -Uri $Url -OutFile $installer -UseBasicParsing
+              
+              if ($IsMsi) {
+                Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
+              } else {
+                Start-Process -FilePath $installer -ArgumentList $InstallerArgs -Wait
               }
+              
+              Write-Host "✓ $Name installed successfully"
+            } catch {
+              Write-Warning "Failed to install $Name : $_"
+            } finally {
+              if (Test-Path $installer) { Remove-Item $installer -Force -ErrorAction SilentlyContinue }
             }
-            
-            # Verify file exists and has size > 0
-            if (-not (Test-Path $OutFile)) {
-              throw "Download failed: File not created"
-            }
-            
-            $fileSize = (Get-Item $OutFile).Length
-            Write-Host "File size: $fileSize bytes"
-            
-            if ($fileSize -eq 0) {
-              throw "Download failed: File is empty"
-            }
-            
-            # Install
-            Write-Host "Installing..."
-            Start-Process $OutFile -ArgumentList $Args -Wait
-            Write-Host "Installation complete"
           }
+
+          # Install tools
+          $tools = @(
+            @{Name="qBittorrent"; Url="https://sourceforge.net/projects/qbittorrent/files/qbittorrent-win32/qbittorrent-4.6.5/qbittorrent_4.6.5_x64_setup.exe/download"; Args="/S"}
+            @{Name="MKVToolNix"; Url="https://mkvtoolnix.download/windows/releases/85.0/mkvtoolnix-64-bit-85.0.7z"; $IsArchive=$true} # Requires 7zip extraction
+            @{Name="AdvancedRenamer"; Url="https://www.advancedrenamer.com/down/advanced_renamer_setup_3.88.exe"; Args="/VERYSILENT"}
+            @{Name="MediaInfo_GUI"; Url="https://mediaarea.net/download/binary/mediainfo-gui/24.06/MediaInfo_GUI_24.06_Windows.exe"; Args="/S"}
+            @{Name="Inviska_MKV_Extract"; Url="https://www.inviska.com/files/mkvextract/download/Inviska_MKV_Extract_2.3.0_Setup.exe"; Args="/S"}
+            @{Name="JDownloader2"; Url="https://installer.jdownloader.org/JD2Setup_x64.exe"; Args="/S"}
+            @{Name="MKV_Muxing_Batch_GUI"; Url="https://github.com/yubiuser/mkv-muxing-batch-gui/releases/download/v2.3/MKV.Muxing.Batch.GUI_2.3_Setup.exe"; Args="/S"}
+          )
+
+          # Install 7-Zip first for archive extraction
+          Write-Host "Installing 7-Zip..."
+          $7zUrl = "https://www.7-zip.org/a/7z2409-x64.exe"
+          $7zInstaller = "$env:TEMP\7z.exe"
+          Invoke-WebRequest -Uri $7zUrl -OutFile $7zInstaller -UseBasicParsing
+          Start-Process -FilePath $7zInstaller -ArgumentList "/S" -Wait
           
-          # qBittorrent
-          Safe-Install -Url "https://downloads.sourceforge.net/project/qbittorrent/qbittorrent-win32/qbittorrent-4.6.3/qbittorrent_4.6.3_x64_setup.exe" `
-                       -OutFile "$tmp\qb.exe" `
-                       -Args "/S"
-          
-          # MKVToolNix
-          Safe-Install -Url "https://mkvtoolnix.download/windows/releases/86.0/mkvtoolnix-64-bit-86.0-setup.exe" `
-                       -OutFile "$tmp\mkvtoolnix.exe" `
-                       -Args "/S"
-          
-          # MediaInfo GUI
-          Safe-Install -Url "https://mediaarea.net/download/binary/mediainfo-gui/24.01/MediaInfo_GUI_24.01_Windows.exe" `
-                       -OutFile "$tmp\mediainfo.exe" `
-                       -Args "/S"
-          
-          # Advanced Renamer
-          Safe-Install -Url "https://www.advancedrenamer.com/down/advanced_renamer_setup.exe" `
-                       -OutFile "$tmp\renamer.exe" `
-                       -Args "/VERYSILENT"
-          
-          # JDownloader2
-          Safe-Install -Url "https://installer.jdownloader.org/JDownloader2Setup.exe" `
-                       -OutFile "$tmp\jd.exe" `
-                       -Args "/S"
+          # Install each tool
+          foreach ($tool in $tools) {
+            if ($tool.ContainsKey('IsArchive') -and $tool.IsArchive) {
+              # Handle 7z archives
+              $archive = "$env:TEMP\$($tool.Name).7z"
+              Invoke-WebRequest -Uri $tool.Url -OutFile $archive -UseBasicParsing
+              & "C:\Program Files\7-Zip\7z.exe" x "$archive" -o"$installDir\$($tool.Name)" -y | Out-Null
+              Write-Host "✓ $($tool.Name) extracted to $installDir"
+            } else {
+              Install-Tool -Name $tool.Name -Url $tool.Url -InstallerArgs $($tool.Args)
+            }
+          }
+
+          # Add tools directory to PATH
+          $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($currentPath -notlike "*$installDir*") {
+            [Environment]::SetEnvironmentVariable("Path", "$currentPath;$installDir", "User")
+          }
+
+          Write-Host "✅ All tools installed successfully!"
 
       - name: 🔗 Tailscale up
         id: up
@@ -220,77 +227,27 @@ jobs:
 
       - name: 🔁 Dispatch workflow B
         if: always()
-        env:
-          GH_TOKEN: ${{ steps.cfg.outputs.pat }}
         run: |
           $loops=[int]"${{ steps.cfg.outputs.loops }}"
-          if ($loops -eq 1) { 
-            Write-Host "Last iteration, not dispatching"
-            exit 0 
-          }
-          if ($loops -gt 1) { 
-            $next=$loops-1 
-          } else { 
-            $next=0
-          }
-          
-          Write-Host "Dispatching workflow B with next loops=$next"
-          
-          # Create dispatch payload
+          if ($loops -eq 1) { exit 0 }
+          if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
+
+          $token="${{ steps.cfg.outputs.pat }}"
+
           $body=@{
             ref    = "${{ github.ref_name }}"
             inputs = @{
               ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
               ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
               ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
-              gh_api_token    = "${{ steps.cfg.outputs.pat }}"
+              gh_api_token    = "$token"
               test_mode       = "false"
               runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
               loops           = "$next"
             }
           } | ConvertTo-Json -Depth 5
-          
-          # Try to dispatch
-          $uri = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches"
-          
-          try {
-            Write-Host "Dispatching to: $uri"
-            
-            $response = Invoke-RestMethod -Method POST `
-              -Uri $uri `
-              -Headers @{ 
-                Authorization = "Bearer ${{ steps.cfg.outputs.pat }}"
-                Accept = "application/vnd.github+json"
-                "X-GitHub-Api-Version" = "2022-11-28"
-              } `
-              -Body $body `
-              -ContentType "application/json" `
-              -ErrorAction Stop
-            
-            Write-Host "✅ Successfully dispatched workflow B"
-          }
-          catch {
-            Write-Host "❌ Dispatch failed: $_"
-            
-            # Check if workflow exists
-            try {
-              $checkUri = "https://api.github.com/repos/${{ github.repository }}/actions/workflows"
-              $workflows = Invoke-RestMethod -Uri $checkUri -Headers @{
-                Authorization = "Bearer ${{ steps.cfg.outputs.pat }}"
-                Accept = "application/vnd.github+json"
-              }
-              
-              $workflowExists = $workflows.workflows | Where-Object { $_.path -like "*windows-rdp-tailscale-B.yml*" }
-              
-              if (-not $workflowExists) {
-                Write-Host "⚠️ Workflow B file not found in repository!"
-                Write-Host "Please create .github/workflows/windows-rdp-tailscale-B.yml with workflow_dispatch trigger"
-              }
-            }
-            catch {
-              Write-Host "Could not check workflows: $_"
-            }
-            
-            # Don't fail the job on dispatch error
-            Write-Host "Continuing despite dispatch error"
-          }
+
+          Invoke-RestMethod -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
+            -Headers @{ Authorization = "Bearer $token"; Accept="application/vnd.github+json" } `
+            -Body $body

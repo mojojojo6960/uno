@@ -124,6 +124,30 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
+      - name: 📦 Install Release Tools
+        run: |
+          $tmp="$env:TEMP"
+
+          # qBittorrent
+          Invoke-WebRequest "https://downloads.sourceforge.net/project/qbittorrent/qbittorrent-win32/qbittorrent-4.6.3/qbittorrent_4.6.3_x64_setup.exe" -OutFile "$tmp\qb.exe"
+          Start-Process "$tmp\qb.exe" -ArgumentList "/S" -Wait
+
+          # MKVToolNix
+          Invoke-WebRequest "https://mkvtoolnix.download/windows/releases/86.0/mkvtoolnix-64-bit-86.0-setup.exe" -OutFile "$tmp\mkvtoolnix.exe"
+          Start-Process "$tmp\mkvtoolnix.exe" -ArgumentList "/S" -Wait
+
+          # MediaInfo GUI
+          Invoke-WebRequest "https://mediaarea.net/download/binary/mediainfo-gui/24.01/MediaInfo_GUI_24.01_Windows.exe" -OutFile "$tmp\mediainfo.exe"
+          Start-Process "$tmp\mediainfo.exe" -ArgumentList "/S" -Wait
+
+          # Advanced Renamer
+          Invoke-WebRequest "https://www.advancedrenamer.com/down/advanced_renamer_setup.exe" -OutFile "$tmp\renamer.exe"
+          Start-Process "$tmp\renamer.exe" -ArgumentList "/VERYSILENT" -Wait
+
+          # JDownloader2
+          Invoke-WebRequest "https://installer.jdownloader.org/JDownloader2Setup.exe" -OutFile "$tmp\jd.exe"
+          Start-Process "$tmp\jd.exe" -ArgumentList "/S" -Wait
+
       - name: 🔗 Tailscale up
         id: up
         run: |
@@ -141,14 +165,6 @@ jobs:
           "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
           "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
           "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
-
-      - name: 📦 Install Apps via winget
-        run: |
-          winget install -e --id qBittorrent.qBittorrent --silent
-          winget install -e --id MoritzBunkus.MKVToolNix --silent
-          winget install -e --id MediaArea.MediaInfo.GUI --silent
-          winget install -e --id HulubuluSoftware.AdvancedRenamer --silent
-          winget install -e --id AppWork.JDownloader --silent
 
       - name: ⏳ Keep alive
         run: |

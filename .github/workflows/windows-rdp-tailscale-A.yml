@@ -42,7 +42,7 @@ defaults:
 
 env:
   RDP_USER: HolySpider
-  RDP_PASS: 156225
+  RDP_PASS: Spider12345
   TS_HOSTNAME: bullet
 
 jobs:

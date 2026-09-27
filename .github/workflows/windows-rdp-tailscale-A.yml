@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # ExpressVPN behavior in this workflow:
 #   - Installs winget CLI (not preinstalled on windows-2022 runners).
-#   - Installs ExpressVPN via winget.
+#   - Installs ExpressVPN via winget (winget source only, bypasses msstore cert error).
 #   - Verifies install path, service, and creates a public desktop shortcut.
 #   - Does NOT activate, does NOT connect, does NOT launch the GUI.
 #   - You log into the ExpressVPN GUI yourself once inside RDP.
@@ -161,16 +161,17 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # ---------------------------------------------------------------------
-      # 5. Install ExpressVPN via winget (install only - no login, no GUI)
+      # 5. Install ExpressVPN via winget (winget source only - skips msstore cert error)
       # ---------------------------------------------------------------------
       - name: 🌐 Install ExpressVPN (via winget)
         if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
         run: |
           $ErrorActionPreference = 'Continue'
 
-          Write-Host "Installing ExpressVPN via winget..."
+          Write-Host "Installing ExpressVPN via winget (source: winget)..."
 
-          winget install --id ExpressVPN.ExpressVPN --exact `
+          # --source winget skips the msstore source, avoiding error 0x8a15005e
+          winget install --id ExpressVPN.ExpressVPN --exact --source winget `
             --silent --accept-package-agreements --accept-source-agreements
 
           if ($LASTEXITCODE -ne 0) {

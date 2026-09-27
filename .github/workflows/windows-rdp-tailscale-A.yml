@@ -2,7 +2,7 @@
 # Windows RDP via Tailscale (A)
 # -----------------------------------------------------------------------------
 # ExpressVPN behavior in this workflow:
-#   - Downloads + silently installs ExpressVPN 14.2.0.13656 (x64), elevated.
+#   - Installs ExpressVPN via winget (handles elevation + switches cleanly).
 #   - Verifies install path, service, and creates a public desktop shortcut.
 #   - Does NOT activate, does NOT connect, does NOT launch the GUI.
 #   - You log into the ExpressVPN GUI yourself once inside RDP.
@@ -151,46 +151,22 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # ---------------------------------------------------------------------
-      # 4. Install ExpressVPN (install only - elevated, silent, no login)
+      # 4. Install ExpressVPN via winget (install only - no login, no GUI)
       # ---------------------------------------------------------------------
-      - name: 🌐 Install ExpressVPN (silent, install-only)
+      - name: 🌐 Install ExpressVPN (via winget)
         if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
 
-          $installer = "$env:TEMP\expressvpn.exe"
-          $url = "https://www.expressvpn.works/clients/windows/expressvpn-windows-x64-14.2.0.13656_release.exe"
-          $expectedHash = "489DC69CDFE9EDB28249740033D5623DC756A32742F63575D85B18B6B42EAA86"
+          Write-Host "Installing ExpressVPN via winget..."
 
-          Write-Host "Downloading ExpressVPN 14.2.0.13656..."
-          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 300
+          winget install --id ExpressVPN.ExpressVPN --exact `
+            --silent --accept-package-agreements --accept-source-agreements
 
-          # Verify integrity
-          $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash
-          if ($actualHash -ne $expectedHash) {
-            Write-Warning "SHA256 mismatch! Expected $expectedHash, got $actualHash"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "winget exit code: $LASTEXITCODE"
           } else {
-            Write-Host "✅ SHA256 verified."
-          }
-
-          # ---- Install with elevation ----
-          $logPath = "$env:TEMP\ExpressVPN-install.log"
-          Write-Host "Installing ExpressVPN (elevated, silent)..."
-          try {
-            $proc = Start-Process -FilePath $installer `
-              -ArgumentList "/install /quiet /norestart /log `"$logPath`"" `
-              -Wait -PassThru -Verb RunAs
-            Write-Host "Installer exit code: $($proc.ExitCode)"
-          } catch {
-            Write-Warning "Start-Process failed: $_"
-          }
-
-          # ---- Dump installer log if we have it ----
-          if (Test-Path $logPath) {
-            Write-Host "--- Installer log (last 40 lines) ---"
-            Get-Content $logPath -Tail 40 | ForEach-Object { Write-Host "  $_" }
-          } else {
-            Write-Warning "No installer log found at $logPath"
+            Write-Host "✅ Winget install completed."
           }
 
           Start-Sleep -Seconds 30
@@ -225,7 +201,6 @@ jobs:
             Write-Warning "ExpressVPNService not registered."
           }
 
-          Remove-Item $installer -Force -ErrorAction SilentlyContinue
           Write-Host "Done. Log into the GUI after RDP."
 
       # ---------------------------------------------------------------------

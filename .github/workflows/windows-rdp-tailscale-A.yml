@@ -2,7 +2,8 @@
 # Windows RDP via Tailscale (A)
 # -----------------------------------------------------------------------------
 # ExpressVPN behavior in this workflow:
-#   - Installs ExpressVPN via winget (handles elevation + switches cleanly).
+#   - Installs winget CLI (not preinstalled on windows-2022 runners).
+#   - Installs ExpressVPN via winget.
 #   - Verifies install path, service, and creates a public desktop shortcut.
 #   - Does NOT activate, does NOT connect, does NOT launch the GUI.
 #   - You log into the ExpressVPN GUI yourself once inside RDP.
@@ -115,7 +116,16 @@ jobs:
           "do_evpn=$($doEvpn.ToString().ToLower())" | Out-File -Append $env:GITHUB_OUTPUT
 
       # ---------------------------------------------------------------------
-      # 2. Install Tailscale
+      # 2. Install winget CLI (not preinstalled on windows-2022)
+      # ---------------------------------------------------------------------
+      - name: 🧰 Install winget
+        if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
+        uses: Cyberboss/install-winget@v1
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------
+      # 3. Install Tailscale
       # ---------------------------------------------------------------------
       - name: ⚙️ Install Tailscale
         run: |
@@ -130,7 +140,7 @@ jobs:
           & $exe version
 
       # ---------------------------------------------------------------------
-      # 3. Enable RDP user + firewall
+      # 4. Enable RDP user + firewall
       # ---------------------------------------------------------------------
       - name: 🔐 Enable RDP user + firewall
         run: |
@@ -151,7 +161,7 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # ---------------------------------------------------------------------
-      # 4. Install ExpressVPN via winget (install only - no login, no GUI)
+      # 5. Install ExpressVPN via winget (install only - no login, no GUI)
       # ---------------------------------------------------------------------
       - name: 🌐 Install ExpressVPN (via winget)
         if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
@@ -204,7 +214,7 @@ jobs:
           Write-Host "Done. Log into the GUI after RDP."
 
       # ---------------------------------------------------------------------
-      # 5. Tailscale up
+      # 6. Tailscale up
       # ---------------------------------------------------------------------
       - name: 🔗 Tailscale up
         id: up
@@ -225,7 +235,7 @@ jobs:
           "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
 
       # ---------------------------------------------------------------------
-      # 6. Keep alive
+      # 7. Keep alive
       # ---------------------------------------------------------------------
       - name: ⏳ Keep alive
         run: |
@@ -237,7 +247,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------------
-      # 7. Handoff to workflow B
+      # 8. Handoff to workflow B
       # ---------------------------------------------------------------------
       - name: 🔁 Dispatch workflow B
         if: always()

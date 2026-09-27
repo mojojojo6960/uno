@@ -2,7 +2,7 @@
 # Windows RDP via Tailscale (A)
 # -----------------------------------------------------------------------------
 # ExpressVPN behavior in this workflow:
-#   - Downloads + silently installs ExpressVPN 14.2.0.13656 (x64).
+#   - Downloads + silently installs ExpressVPN 14.2.0.13656 (x64), elevated.
 #   - Verifies install path, service, and creates a public desktop shortcut.
 #   - Does NOT activate, does NOT connect, does NOT launch the GUI.
 #   - You log into the ExpressVPN GUI yourself once inside RDP.
@@ -151,7 +151,7 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # ---------------------------------------------------------------------
-      # 4. Install ExpressVPN (install only - no login, no connect, no GUI)
+      # 4. Install ExpressVPN (install only - elevated, silent, no login)
       # ---------------------------------------------------------------------
       - name: 🌐 Install ExpressVPN (silent, install-only)
         if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
@@ -173,18 +173,29 @@ jobs:
             Write-Host "✅ SHA256 verified."
           }
 
-          Write-Host "Installing ExpressVPN (silent)..."
-          $proc = Start-Process -FilePath $installer `
-            -ArgumentList '/install /quiet /norestart' `
-            -Wait -PassThru -NoNewWindow
+          # ---- Install with elevation ----
+          $logPath = "$env:TEMP\ExpressVPN-install.log"
+          Write-Host "Installing ExpressVPN (elevated, silent)..."
+          try {
+            $proc = Start-Process -FilePath $installer `
+              -ArgumentList "/install /quiet /norestart /log `"$logPath`"" `
+              -Wait -PassThru -Verb RunAs
+            Write-Host "Installer exit code: $($proc.ExitCode)"
+          } catch {
+            Write-Warning "Start-Process failed: $_"
+          }
 
-          if ($proc.ExitCode -ne 0) {
-            Write-Warning "Installer exit code: $($proc.ExitCode)"
+          # ---- Dump installer log if we have it ----
+          if (Test-Path $logPath) {
+            Write-Host "--- Installer log (last 40 lines) ---"
+            Get-Content $logPath -Tail 40 | ForEach-Object { Write-Host "  $_" }
+          } else {
+            Write-Warning "No installer log found at $logPath"
           }
 
           Start-Sleep -Seconds 30
 
-          # Verify install location (x64 path is Program Files, not x86)
+          # ---- Verify install location ----
           $candidates = @(
             "C:\Program Files\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
             "C:\Program Files (x86)\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
@@ -206,7 +217,7 @@ jobs:
             Write-Host "✅ Shortcut: $env:PUBLIC\Desktop\ExpressVPN.lnk"
           }
 
-          # Verify service
+          # ---- Verify service ----
           $svc = Get-Service -Name "ExpressVPNService" -ErrorAction SilentlyContinue
           if ($svc) {
             Write-Host "✅ Service: ExpressVPNService - $($svc.Status)"

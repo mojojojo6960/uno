@@ -1,17 +1,11 @@
 # =============================================================================
 # Windows RDP via Tailscale (A)
 # -----------------------------------------------------------------------------
-# ⚠️  EXPRESSVPN CAVEATS (READ BEFORE USING):
-#   1. ExpressVPN has NO official Windows CLI. This workflow installs it,
-#      launches the GUI, and attempts a best-effort `--activate`/`connect`.
-#      Most builds will require you to finish activation manually over RDP.
-#   2. ExpressVPN's kill-switch WILL drop your RDP session once active unless
-#      you whitelist the Tailscale interface. This workflow attempts to add
-#      the exclusion, but it may not stick on all builds.
-#   3. GitHub-hosted Windows runners frequently CANNOT reach ExpressVPN
-#      endpoints (Azure IPs are blocked/throttled). Expect failures.
-#   4. Using GH runners as long-lived VPN + RDP endpoints violates GitHub's
-#      Acceptable Use Policies. You have been warned.
+# ExpressVPN behavior in this workflow:
+#   - Downloads + silently installs ExpressVPN 14.2.0.13656 (x64).
+#   - Verifies install path, service, and creates a public desktop shortcut.
+#   - Does NOT activate, does NOT connect, does NOT launch the GUI.
+#   - You log into the ExpressVPN GUI yourself once inside RDP.
 # =============================================================================
 
 name: Windows RDP via Tailscale (A)
@@ -43,23 +37,10 @@ on:
         description: "How many handoffs (0 = infinite)"
         required: false
         default: "0"
-      # --- ExpressVPN inputs (optional) ---
-      evpn_activate_code:
-        description: "ExpressVPN activation code (from account page)"
-        required: false
-        default: ""
-      evpn_username:
-        description: "ExpressVPN account email (for reference / RDP login)"
-        required: false
-        default: ""
-      evpn_password:
-        description: "ExpressVPN account password (for reference / RDP login)"
-        required: false
-        default: ""
-      evpn_server:
-        description: "Preferred ExpressVPN server (e.g. 'smart', 'usa-new_york-1')"
-        required: false
-        default: "smart"
+      install_expressvpn:
+        description: "Install ExpressVPN (you'll log in over RDP)"
+        type: boolean
+        default: true
 
 concurrency:
   group: tailscale-rdp-singleton
@@ -97,10 +78,7 @@ jobs:
           RAW_TEST: ${{ inputs.test_mode == true && 'true' || 'false' }}
           RAW_RUNTIME: ${{ inputs.runtime_minutes || '355' }}
           RAW_LOOPS: ${{ inputs.loops || '0' }}
-          RAW_EVPN_CODE: ${{ inputs.evpn_activate_code }}
-          RAW_EVPN_USER: ${{ inputs.evpn_username }}
-          RAW_EVPN_PASS: ${{ inputs.evpn_password }}
-          RAW_EVPN_SRV: ${{ inputs.evpn_server || 'smart' }}
+          RAW_EVPN: ${{ inputs.install_expressvpn == true && 'true' || 'false' }}
         run: |
           function ToIntOr($v, $def) {
             if ("$v" -match '^\d+$') { [int]$v } else { [int]$def }
@@ -117,6 +95,7 @@ jobs:
           }
 
           $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
+          $doEvpn = ($env:RAW_EVPN -match '^(?i:true|1|yes|on)$')
 
           $runtime = ToIntOr $env:RAW_RUNTIME 355
           if ($isTest) { $runtime = 5 }
@@ -133,12 +112,7 @@ jobs:
           "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
-
-          # ExpressVPN (optional)
-          "evpn_code=$env:RAW_EVPN_CODE" | Out-File -Append $env:GITHUB_OUTPUT
-          "evpn_user=$env:RAW_EVPN_USER" | Out-File -Append $env:GITHUB_OUTPUT
-          "evpn_pass=$env:RAW_EVPN_PASS" | Out-File -Append $env:GITHUB_OUTPUT
-          "evpn_srv=$env:RAW_EVPN_SRV"   | Out-File -Append $env:GITHUB_OUTPUT
+          "do_evpn=$($doEvpn.ToString().ToLower())" | Out-File -Append $env:GITHUB_OUTPUT
 
       # ---------------------------------------------------------------------
       # 2. Install Tailscale
@@ -177,7 +151,74 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # ---------------------------------------------------------------------
-      # 4. Tailscale up
+      # 4. Install ExpressVPN (install only - no login, no connect, no GUI)
+      # ---------------------------------------------------------------------
+      - name: 🌐 Install ExpressVPN (silent, install-only)
+        if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $installer = "$env:TEMP\expressvpn.exe"
+          $url = "https://www.expressvpn.works/clients/windows/expressvpn-windows-x64-14.2.0.13656_release.exe"
+          $expectedHash = "489DC69CDFE9EDB28249740033D5623DC756A32742F63575D85B18B6B42EAA86"
+
+          Write-Host "Downloading ExpressVPN 14.2.0.13656..."
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 300
+
+          # Verify integrity
+          $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            Write-Warning "SHA256 mismatch! Expected $expectedHash, got $actualHash"
+          } else {
+            Write-Host "✅ SHA256 verified."
+          }
+
+          Write-Host "Installing ExpressVPN (silent)..."
+          $proc = Start-Process -FilePath $installer `
+            -ArgumentList '/install /quiet /norestart' `
+            -Wait -PassThru -NoNewWindow
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Warning "Installer exit code: $($proc.ExitCode)"
+          }
+
+          Start-Sleep -Seconds 30
+
+          # Verify install location (x64 path is Program Files, not x86)
+          $candidates = @(
+            "C:\Program Files\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
+            "C:\Program Files (x86)\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
+            "C:\Program Files\ExpressVPN\ExpressVPN.exe",
+            "C:\Program Files (x86)\ExpressVPN\ExpressVPN.exe"
+          )
+          $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Warning "ExpressVPN EXE not found after install."
+          } else {
+            Write-Host "✅ ExpressVPN installed at: $exe"
+
+            # Public desktop shortcut so you see it when you RDP in
+            $ws = New-Object -ComObject WScript.Shell
+            $lnk = $ws.CreateShortcut("$env:PUBLIC\Desktop\ExpressVPN.lnk")
+            $lnk.TargetPath = $exe
+            $lnk.Save()
+            Write-Host "✅ Shortcut: $env:PUBLIC\Desktop\ExpressVPN.lnk"
+          }
+
+          # Verify service
+          $svc = Get-Service -Name "ExpressVPNService" -ErrorAction SilentlyContinue
+          if ($svc) {
+            Write-Host "✅ Service: ExpressVPNService - $($svc.Status)"
+          } else {
+            Write-Warning "ExpressVPNService not registered."
+          }
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          Write-Host "Done. Log into the GUI after RDP."
+
+      # ---------------------------------------------------------------------
+      # 5. Tailscale up
       # ---------------------------------------------------------------------
       - name: 🔗 Tailscale up
         id: up
@@ -196,113 +237,6 @@ jobs:
           "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
           "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
           "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
-
-      # ---------------------------------------------------------------------
-      # 5. ExpressVPN install + best-effort activate (OPTIONAL)
-      #    Runs only if evpn_activate_code was supplied.
-      #    continue-on-error so a VPN failure never kills the RDP session.
-      # ---------------------------------------------------------------------
-      - name: 🌐 Install & configure ExpressVPN
-        id: evpn
-        if: ${{ steps.cfg.outputs.evpn_code != '' }}
-        continue-on-error: true
-        env:
-          EVPN_CODE: ${{ steps.cfg.outputs.evpn_code }}
-          EVPN_SRV:  ${{ steps.cfg.outputs.evpn_srv }}
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          function Log($m) { Write-Host "[evpn] $m" }
-
-          # ---- Kill-switch pre-exclusion for Tailscale ------------------
-          # We add Tailscale's interface to the Windows Firewall allow list
-          # BEFORE ExpressVPN installs, so its kill-switch is less likely
-          # to sever our RDP path.
-          try {
-            New-NetFirewallRule -DisplayName "Allow Tailscale (ExpressVPN bypass)" `
-              -Direction Inbound -Action Allow -Protocol Any `
-              -InterfaceAlias "Tailscale" -ErrorAction SilentlyContinue | Out-Null
-            Log "Added Tailscale inbound firewall rule."
-          } catch { Log "Firewall rule add failed: $_" }
-
-          # ---- Download ------------------------------------------------
-          $installer = "$env:TEMP\expressvpn.exe"
-          $url = "https://www.expressvpn.works/clients/windows/expressvpn_windows_12.90.0.16_release.exe"
-          Log "Downloading ExpressVPN..."
-          try {
-            Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 180
-            Log "Downloaded to $installer"
-          } catch {
-            Log "Download FAILED: $_"
-            exit 0
-          }
-
-          # ---- Install silently ---------------------------------------
-          Log "Installing ExpressVPN silently..."
-          try {
-            Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow
-            Start-Sleep -Seconds 25
-          } catch {
-            Log "Installer launch failed: $_"
-            exit 0
-          }
-
-          # ---- Locate the client EXE ----------------------------------
-          $candidates = @(
-            "C:\Program Files (x86)\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
-            "C:\Program Files\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
-            "C:\Program Files (x86)\ExpressVPN\ExpressVPN.exe",
-            "C:\Program Files\ExpressVPN\ExpressVPN.exe"
-          )
-          $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $exe) {
-            Log "ExpressVPN client EXE not found. Skipping activation."
-            exit 0
-          }
-          Log "Found client: $exe"
-          "exe=$exe" | Out-File -Append $env:GITHUB_OUTPUT
-
-          # ---- Service status -----------------------------------------
-          $svc = Get-Service -Name "ExpressVPNService" -ErrorAction SilentlyContinue
-          if ($svc) { Log "ExpressVPNService: $($svc.Status)" }
-
-          # ---- Best-effort CLI activation (build-dependent) -----------
-          # Some builds accept: ExpressVPN.exe --activate <code>
-          # Many do NOT. If it fails, we fall back to GUI-over-RDP.
-          Log "Attempting best-effort CLI activation..."
-          try {
-            & $exe --activate "$env:EVPN_CODE" 2>&1 | ForEach-Object { Log $_ }
-          } catch {
-            Log "CLI activation not supported on this build: $_"
-          }
-
-          # ---- Launch GUI so user can finish over RDP -----------------
-          Log "Launching ExpressVPN GUI (finish activation over RDP if needed)."
-          try {
-            Start-Process -FilePath $exe
-            Start-Sleep -Seconds 8
-          } catch { Log "GUI launch failed: $_" }
-
-          # ---- Best-effort connect ------------------------------------
-          Log "Attempting best-effort connect to '$env:EVPN_SRV'..."
-          try {
-            & $exe connect "$env:EVPN_SRV" 2>&1 | ForEach-Object { Log $_ }
-            Start-Sleep -Seconds 10
-          } catch {
-            Log "CLI connect not supported on this build: $_"
-          }
-
-          # ---- Post-connect status ------------------------------------
-          try {
-            $adapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match "ExpressVPN|TAP" } | Select-Object -First 1
-            if ($adapter) {
-              Log "VPN adapter: $($adapter.Name) - $($adapter.Status)"
-            } else {
-              Log "No ExpressVPN TAP adapter visible."
-            }
-          } catch { Log "Adapter probe failed: $_" }
-
-          Log "ExpressVPN setup step complete (may require manual finish via RDP)."
 
       # ---------------------------------------------------------------------
       # 6. Keep alive
@@ -338,10 +272,7 @@ jobs:
               test_mode          = "false"
               runtime_minutes    = "${{ steps.cfg.outputs.runtime }}"
               loops              = "$next"
-              evpn_activate_code = "${{ steps.cfg.outputs.evpn_code }}"
-              evpn_username      = "${{ steps.cfg.outputs.evpn_user }}"
-              evpn_password      = "${{ steps.cfg.outputs.evpn_pass }}"
-              evpn_server        = "${{ steps.cfg.outputs.evpn_srv }}"
+              install_expressvpn = "${{ steps.cfg.outputs.do_evpn }}"
             }
           } | ConvertTo-Json -Depth 5
 

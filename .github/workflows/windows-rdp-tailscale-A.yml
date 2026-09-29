@@ -235,17 +235,31 @@ jobs:
           "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
           "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
 
+          Write-Host "=============================="
+          Write-Host "  RDP READY"
+          Write-Host "  Address : $ip4:3389"
+          Write-Host "  FQDN    : $fqdn"
+          Write-Host "  User    : ${{ env.RDP_USER }}"
+          Write-Host "  Password: ${{ env.RDP_PASS }}"
+          Write-Host "  DERP    : $derp"
+          Write-Host "=============================="
+
       # ---------------------------------------------------------------------
-      # 7. Keep alive
+      # 7. Keep alive (5-min heartbeat, quiet log)
       # ---------------------------------------------------------------------
       - name: ⏳ Keep alive
         run: |
-          $mins=[int]"${{ steps.cfg.outputs.runtime }}"
-          $end=(Get-Date).AddMinutes($mins)
-          Write-Host "Keeping session alive for $mins minutes (until $end)..."
-          while((Get-Date) -lt $end){
-            Start-Sleep -Seconds 60
+          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
+          $end  = (Get-Date).AddMinutes($mins)
+          $i    = 0
+          Write-Host "Keep alive started. Runtime: $mins min. Ends at: $end"
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 300
+            $i++
+            $remaining = [int](($end - (Get-Date)).TotalMinutes)
+            Write-Host "[heartbeat $i] $remaining min remaining"
           }
+          Write-Host "Keep alive finished."
 
       # ---------------------------------------------------------------------
       # 8. Handoff to workflow B

@@ -1,293 +1,299 @@
 # =============================================================================
-# Windows RDP via Tailscale (A)
+# Windows RDP via Tailscale (self-chaining)
 # -----------------------------------------------------------------------------
-# ExpressVPN behavior in this workflow:
-#   - Installs winget CLI (not preinstalled on windows-2022 runners).
-#   - Installs ExpressVPN via winget (winget source only, bypasses msstore cert error).
-#   - Verifies install path, service, and creates a public desktop shortcut.
-#   - Does NOT activate, does NOT connect, does NOT launch the GUI.
-#   - You log into the ExpressVPN GUI yourself once inside RDP.
+# One file, no A/B pair. Each run ends ~345 min after it starts and dispatches
+# the same workflow again, so a fresh runner takes over (about 5 min gap).
+#
+# REQUIRED repository secrets  (Settings > Secrets and variables > Actions):
+#   TS_AUTHKEY   Tailscale auth key (reusable + ephemeral recommended)
+#   TS_API_KEY   Tailscale API key  (used only to remove the stale device that
+#                holds the hostname, so the hostname stays the same each run)
+#   RDP_PASS     Password for the RDP user (Windows complexity rules apply)
+#
+# No GitHub PAT is needed: the built-in GITHUB_TOKEN may trigger workflow_dispatch
+# on its own repository when the job has `actions: write`.
+#
+# Stop the chain: Actions tab > cancel the running job AND the pending one,
+# or start it once with loops = 1.
 # =============================================================================
 
-name: Windows RDP via Tailscale (A)
+name: Windows RDP via Tailscale
 
 on:
   workflow_dispatch:
     inputs:
-      ts_tailnet:
-        description: "Tailscale tailnet (e.g. you@gmail.com)"
-        required: true
-      ts_api_key:
-        description: "Tailscale API key (device admin, no 'Bearer')"
-        required: true
-      ts_authkey:
-        description: "Tailscale auth key (reusable or ephemeral)"
-        required: true
-      gh_api_token:
-        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
-        required: true
-      test_mode:
-        description: "Run 5-minute test loop"
-        type: boolean
-        default: false
       runtime_minutes:
-        description: "Runtime in minutes (max 360; capped to 355)"
+        description: "Minutes to stay alive, counted from job start (6-350)"
         required: false
-        default: "355"
+        default: "345"
       loops:
-        description: "How many handoffs (0 = infinite)"
+        description: "Runs to chain (0 = infinite, 1 = this run only)"
         required: false
         default: "0"
       install_expressvpn:
-        description: "Install ExpressVPN (you'll log in over RDP)"
+        description: "Install ExpressVPN (you log in over RDP)"
         type: boolean
         default: true
+      test_mode:
+        description: "Test: stay alive only 5 minutes"
+        type: boolean
+        default: false
 
+# Only one run at a time; the next run waits until this one has finished.
 concurrency:
   group: tailscale-rdp-singleton
   cancel-in-progress: false
 
 permissions:
   contents: read
-  actions: write
+  actions: write # needed to dispatch the next run with GITHUB_TOKEN
 
 defaults:
   run:
     shell: pwsh
 
-env:
-  RDP_USER: HolySpider
-  RDP_PASS: Spider12345
-  TS_HOSTNAME: bullet
-
 jobs:
   rdp:
     runs-on: windows-2022
-    timeout-minutes: 370
+    timeout-minutes: 360 # hard cap for GitHub-hosted runners
+    env:
+      RDP_USER: HolySpider
+      TS_HOSTNAME: bullet
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      TS_API_KEY: ${{ secrets.TS_API_KEY }}
+      RDP_PASS: ${{ secrets.RDP_PASS }}
 
     steps:
-      # ---------------------------------------------------------------------
-      # 1. Resolve inputs
-      # ---------------------------------------------------------------------
-      - name: 🔧 Resolve inputs (safe)
+      # -----------------------------------------------------------------------
+      # 1. Validate secrets + resolve inputs (inputs go through env, never
+      #    interpolated into the script body)
+      # -----------------------------------------------------------------------
+      - name: Resolve settings
         id: cfg
         env:
-          RAW_TAILNET: ${{ inputs.ts_tailnet }}
-          RAW_APIKEY: ${{ inputs.ts_api_key }}
-          RAW_AUTHKEY: ${{ inputs.ts_authkey }}
-          RAW_PAT: ${{ inputs.gh_api_token }}
-          RAW_TEST: ${{ inputs.test_mode == true && 'true' || 'false' }}
-          RAW_RUNTIME: ${{ inputs.runtime_minutes || '355' }}
-          RAW_LOOPS: ${{ inputs.loops || '0' }}
-          RAW_EVPN: ${{ inputs.install_expressvpn == true && 'true' || 'false' }}
+          RAW_RUNTIME: ${{ inputs.runtime_minutes }}
+          RAW_LOOPS: ${{ inputs.loops }}
+          RAW_TEST: ${{ inputs.test_mode }}
+          RAW_EVPN: ${{ inputs.install_expressvpn }}
         run: |
-          function ToIntOr($v, $def) {
-            if ("$v" -match '^\d+$') { [int]$v } else { [int]$def }
+          foreach ($n in 'TS_AUTHKEY','TS_API_KEY','RDP_PASS') {
+            if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($n))) {
+              throw "Missing repository secret: $n"
+            }
           }
 
-          $tailnet = $env:RAW_TAILNET
-          $apiKey  = $env:RAW_APIKEY
-          $authKey = $env:RAW_AUTHKEY
-          $pat     = $env:RAW_PAT
+          function ToIntOr($v, $def) { if ("$v" -match '^\d+$') { [int]$v } else { [int]$def } }
 
-          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) {
-            Write-Error "Missing required inputs"
-            exit 1
-          }
+          $isTest = ("$env:RAW_TEST" -match '^(?i:true|1|yes|on)$')
+          $doEvpn = ("$env:RAW_EVPN" -match '^(?i:true|1|yes|on)$')
 
-          $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
-          $doEvpn = ($env:RAW_EVPN -match '^(?i:true|1|yes|on)$')
-
-          $runtime = ToIntOr $env:RAW_RUNTIME 355
-          if ($isTest) { $runtime = 5 }
-
-          if (-not $isTest -and $runtime -lt 6) { $runtime = 355 }
-          if ($runtime -gt 360) { $runtime = 355 }
+          $runtime = ToIntOr $env:RAW_RUNTIME 345
+          if ($runtime -lt 6)   { $runtime = 345 }
+          if ($runtime -gt 350) { $runtime = 350 }   # leave room before the 360-min cap
 
           $loops = ToIntOr $env:RAW_LOOPS 0
-          if ($loops -lt 0) { $loops = 0 }
 
-          "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
-          "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
-          "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
-          "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
-          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
-          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
-          "do_evpn=$($doEvpn.ToString().ToLower())" | Out-File -Append $env:GITHUB_OUTPUT
+          $start = [DateTime]::UtcNow.ToString('o')
 
-      # ---------------------------------------------------------------------
-      # 2. Install winget CLI (not preinstalled on windows-2022)
-      # ---------------------------------------------------------------------
-      - name: 🧰 Install winget
-        if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
-        uses: Cyberboss/install-winget@v1
-        with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          "runtime=$runtime"                         | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "loops=$loops"                             | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "test=$($isTest.ToString().ToLower())"     | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "evpn=$($doEvpn.ToString().ToLower())"     | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "start=$start"                             | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          Write-Host "runtime=$runtime min, loops=$loops, test=$isTest, expressvpn=$doEvpn"
 
-      # ---------------------------------------------------------------------
-      # 3. Install Tailscale
-      # ---------------------------------------------------------------------
-      - name: ⚙️ Install Tailscale
+      # -----------------------------------------------------------------------
+      # 2. RDP user + service + firewall (RDP reachable only from the tailnet)
+      # -----------------------------------------------------------------------
+      - name: Enable RDP
         run: |
-          $exe = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
-            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-            $dst = "$env:TEMP\tailscale-setup.exe"
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
-            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
-          }
-          Start-Service Tailscale -ErrorAction SilentlyContinue
-          & $exe version
-
-      # ---------------------------------------------------------------------
-      # 4. Enable RDP user + firewall
-      # ---------------------------------------------------------------------
-      - name: 🔐 Enable RDP user + firewall
-        run: |
-          $u="${{ env.RDP_USER }}"
-          $p="${{ env.RDP_PASS }}"
-          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          $u   = $env:RDP_USER
+          $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
 
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember -Group Administrators -Member $u
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires -PasswordNeverExpires | Out-Null
           } else {
-            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Set-LocalUser -Name $u -Password $sec -PasswordNeverExpires $true
             Enable-LocalUser -Name $u
           }
+          foreach ($g in 'Administrators','Remote Desktop Users') {
+            try { Add-LocalGroupMember -Group $g -Member $u -ErrorAction Stop } catch { Write-Host "($u already in $g)" }
+          }
 
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService -ErrorAction SilentlyContinue
 
-      # ---------------------------------------------------------------------
-      # 5. Install ExpressVPN via winget (winget source only - skips msstore cert error)
-      # ---------------------------------------------------------------------
-      - name: 🌐 Install ExpressVPN (via winget)
-        if: ${{ steps.cfg.outputs.do_evpn == 'true' }}
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-NetFirewallRule -DisplayGroup 'Remote Desktop' -Profile Any `
+            -RemoteAddress '100.64.0.0/10','fd7a:115c:a1e0::/48'
+          Write-Host "RDP enabled for $u (tailnet addresses only)"
+
+      # -----------------------------------------------------------------------
+      # 3. Tailscale
+      # -----------------------------------------------------------------------
+      - name: Install Tailscale
         run: |
-          $ErrorActionPreference = 'Continue'
-
-          Write-Host "Installing ExpressVPN via winget (source: winget)..."
-
-          # --source winget skips the msstore source, avoiding error 0x8a15005e
-          winget install --id ExpressVPN.ExpressVPN --exact --source winget `
-            --silent --accept-package-agreements --accept-source-agreements
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "winget exit code: $LASTEXITCODE"
-          } else {
-            Write-Host "✅ Winget install completed."
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path $exe)) {
+            $dst = Join-Path $env:TEMP 'tailscale-setup.exe'
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList '/quiet' -Wait
           }
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $exe); $i++) { Start-Sleep 2 }
+          if (-not (Test-Path $exe)) { throw 'Tailscale did not install' }
 
-          Start-Sleep -Seconds 30
-
-          # ---- Verify install location ----
-          $candidates = @(
-            "C:\Program Files\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
-            "C:\Program Files (x86)\ExpressVPN\expressvpn-ui\ExpressVPN.exe",
-            "C:\Program Files\ExpressVPN\ExpressVPN.exe",
-            "C:\Program Files (x86)\ExpressVPN\ExpressVPN.exe"
-          )
-          $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-          if (-not $exe) {
-            Write-Warning "ExpressVPN EXE not found after install."
-          } else {
-            Write-Host "✅ ExpressVPN installed at: $exe"
-
-            # Public desktop shortcut so you see it when you RDP in
-            $ws = New-Object -ComObject WScript.Shell
-            $lnk = $ws.CreateShortcut("$env:PUBLIC\Desktop\ExpressVPN.lnk")
-            $lnk.TargetPath = $exe
-            $lnk.Save()
-            Write-Host "✅ Shortcut: $env:PUBLIC\Desktop\ExpressVPN.lnk"
+          for ($i = 0; $i -lt 30; $i++) {
+            $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') { break }
+            Start-Service Tailscale -ErrorAction SilentlyContinue
+            Start-Sleep 2
           }
+          & $exe version
 
-          # ---- Verify service ----
-          $svc = Get-Service -Name "ExpressVPNService" -ErrorAction SilentlyContinue
-          if ($svc) {
-            Write-Host "✅ Service: ExpressVPNService - $($svc.Status)"
-          } else {
-            Write-Warning "ExpressVPNService not registered."
-          }
-
-          Write-Host "Done. Log into the GUI after RDP."
-
-      # ---------------------------------------------------------------------
-      # 6. Tailscale up
-      # ---------------------------------------------------------------------
-      - name: 🔗 Tailscale up
+      - name: Tailscale up
         id: up
         run: |
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          & $ts logout | Out-Null
-          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
 
-          Start-Sleep -Seconds 3
-
-          $ip4 = (& $ts ip -4 | Select-Object -First 1)
-          $status = & $ts status --json | ConvertFrom-Json
-          $fqdn = $status.Self.DNSName
-          $derp = $status.Self.DERP
-
-          "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
-          "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
-          "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
-
-          Write-Host "=============================="
-          Write-Host "  RDP READY"
-          Write-Host "  Address : $ip4:3389"
-          Write-Host "  FQDN    : $fqdn"
-          Write-Host "  User    : ${{ env.RDP_USER }}"
-          Write-Host "  Password: ${{ env.RDP_PASS }}"
-          Write-Host "  DERP    : $derp"
-          Write-Host "=============================="
-
-      # ---------------------------------------------------------------------
-      # 7. Keep alive (5-min heartbeat, quiet log)
-      # ---------------------------------------------------------------------
-      - name: ⏳ Keep alive
-        run: |
-          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
-          $end  = (Get-Date).AddMinutes($mins)
-          $i    = 0
-          Write-Host "Keep alive started. Runtime: $mins min. Ends at: $end"
-          while ((Get-Date) -lt $end) {
-            Start-Sleep -Seconds 300
-            $i++
-            $remaining = [int](($end - (Get-Date)).TotalMinutes)
-            Write-Host "[heartbeat $i] $remaining min remaining"
+          # Remove a stale device that still owns the hostname (previous run),
+          # otherwise this one would become "bullet-1".
+          try {
+            $pair = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:TS_API_KEY):"))
+            $h    = @{ Authorization = "Basic $pair" }
+            $devs = (Invoke-RestMethod -Uri 'https://api.tailscale.com/api/v2/tailnet/-/devices' -Headers $h).devices
+            foreach ($d in @($devs | Where-Object { $_.hostname -eq $env:TS_HOSTNAME })) {
+              Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $h | Out-Null
+              Write-Host "Removed stale device $($d.name)"
+            }
+          } catch {
+            Write-Warning "Stale-device cleanup skipped: $($_.Exception.Message)"
           }
-          Write-Host "Keep alive finished."
 
-      # ---------------------------------------------------------------------
-      # 8. Handoff to workflow B
-      # ---------------------------------------------------------------------
-      - name: 🔁 Dispatch workflow B
+          & $exe up --authkey="$env:TS_AUTHKEY" --hostname="$env:TS_HOSTNAME" --accept-routes --accept-dns=false --unattended
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed ($LASTEXITCODE)" }
+
+          $ip4 = $null
+          for ($i = 0; $i -lt 20 -and -not $ip4; $i++) {
+            $ip4 = (& $exe ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip4) { Start-Sleep 1 }
+          }
+          if (-not $ip4) { throw 'No Tailscale IPv4 assigned' }
+          $self = (& $exe status --json | ConvertFrom-Json).Self
+
+          "ip4=$ip4" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          Write-Host '=============================='
+          Write-Host '  RDP READY'
+          Write-Host "  Address : ${ip4}:3389"
+          Write-Host "  FQDN    : $($self.DNSName)"
+          Write-Host "  User    : $($env:RDP_USER)   (password = RDP_PASS secret)"
+          Write-Host '=============================='
+
+      # -----------------------------------------------------------------------
+      # 4. ExpressVPN (optional; failure here never breaks the chain)
+      # -----------------------------------------------------------------------
+      - name: Install winget
+        if: ${{ steps.cfg.outputs.evpn == 'true' }}
+        continue-on-error: true
+        uses: Cyberboss/install-winget@v1
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Install ExpressVPN
+        if: ${{ steps.cfg.outputs.evpn == 'true' }}
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Write-Warning 'winget not available'; exit 0 }
+
+          winget install --id ExpressVPN.ExpressVPN --exact --source winget --silent `
+            --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) { Write-Warning "winget exit code: $LASTEXITCODE" }
+          Start-Sleep 20
+
+          $exe = @(
+            'C:\Program Files\ExpressVPN\expressvpn-ui\ExpressVPN.exe',
+            'C:\Program Files (x86)\ExpressVPN\expressvpn-ui\ExpressVPN.exe',
+            'C:\Program Files\ExpressVPN\ExpressVPN.exe',
+            'C:\Program Files (x86)\ExpressVPN\ExpressVPN.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if ($exe) {
+            $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:PUBLIC\Desktop\ExpressVPN.lnk")
+            $lnk.TargetPath = $exe
+            $lnk.Save()
+            Write-Host "ExpressVPN installed: $exe (desktop shortcut created, log in over RDP)"
+          } else {
+            Write-Warning 'ExpressVPN executable not found after install'
+          }
+          # Note: do NOT connect the VPN on the runner before you are in RDP -
+          # a full-tunnel VPN can cut the Tailscale/runner connection.
+
+      # -----------------------------------------------------------------------
+      # 5. Keep alive until (job start + runtime), so setup time is included
+      # -----------------------------------------------------------------------
+      - name: Keep alive
+        id: keep
+        env:
+          START: ${{ steps.cfg.outputs.start }}
+          RUNTIME: ${{ steps.cfg.outputs.runtime }}
+          TEST: ${{ steps.cfg.outputs.test }}
+        run: |
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+          if ($env:TEST -eq 'true') {
+            $end = [DateTime]::UtcNow.AddMinutes(5)
+          } else {
+            $start = [DateTime]::Parse($env:START, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+            $end   = $start.AddMinutes([int]$env:RUNTIME)
+          }
+          Write-Host "Keep alive until $($end.ToString('u'))"
+          $i = 0
+          while ([DateTime]::UtcNow -lt $end) {
+            Start-Sleep -Seconds ([Math]::Min(300, [Math]::Max(1, [int]($end - [DateTime]::UtcNow).TotalSeconds)))
+            $i++
+            $left = [int]($end - [DateTime]::UtcNow).TotalMinutes
+            $ok   = (& $exe status 2>&1 | Out-String) -notmatch 'Logged out|Stopped'
+            Write-Host "[heartbeat $i] $left min left, tailscale ok=$ok"
+          }
+          Write-Host 'Keep alive finished.'
+
+      # -----------------------------------------------------------------------
+      # 6. Hand off to the next run - ONLY when keep-alive completed normally.
+      #    (No `always()`: a failed or cancelled run does not respawn itself.)
+      # -----------------------------------------------------------------------
+      - name: Dispatch next run
+        if: ${{ success() && steps.keep.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WF_REF: ${{ github.workflow_ref }}
+          REF_NAME: ${{ github.ref_name }}
+          LOOPS: ${{ steps.cfg.outputs.loops }}
+          RUNTIME: ${{ steps.cfg.outputs.runtime }}
+          EVPN: ${{ steps.cfg.outputs.evpn }}
+        run: |
+          $loops = [int]$env:LOOPS
+          if ($loops -eq 1) { Write-Host 'loops=1: last run, not dispatching.'; exit 0 }
+          $next = if ($loops -gt 1) { $loops - 1 } else { 0 }
+
+          # workflow_ref = owner/repo/.github/workflows/<file>.yml@refs/heads/<branch>
+          $wf = Split-Path (($env:WF_REF -split '@')[0]) -Leaf
+          Write-Host "Dispatching $wf on $($env:REF_NAME) (loops -> $next)"
+
+          $done = $false
+          for ($try = 1; $try -le 3 -and -not $done; $try++) {
+            gh workflow run $wf --repo $env:GITHUB_REPOSITORY --ref $env:REF_NAME `
+              -f "runtime_minutes=$($env:RUNTIME)" -f "loops=$next" `
+              -f "install_expressvpn=$($env:EVPN)" -f 'test_mode=false'
+            if ($LASTEXITCODE -eq 0) { $done = $true } else { Write-Warning "dispatch attempt $try failed"; Start-Sleep 10 }
+          }
+          if (-not $done) { throw 'Could not dispatch the next run' }
+
+      # -----------------------------------------------------------------------
+      # 7. Release the tailnet device so the next run can reuse the hostname
+      # -----------------------------------------------------------------------
+      - name: Tailscale logout
         if: always()
         run: |
-          $loops=[int]"${{ steps.cfg.outputs.loops }}"
-          if ($loops -eq 1) { exit 0 }
-          if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
-
-          $token="${{ steps.cfg.outputs.pat }}"
-
-          $body=@{
-            ref    = "${{ github.ref_name }}"
-            inputs = @{
-              ts_tailnet         = "${{ steps.cfg.outputs.tailnet }}"
-              ts_api_key         = "${{ steps.cfg.outputs.apikey }}"
-              ts_authkey         = "${{ steps.cfg.outputs.authkey }}"
-              gh_api_token       = "$token"
-              test_mode          = "false"
-              runtime_minutes    = "${{ steps.cfg.outputs.runtime }}"
-              loops              = "$next"
-              install_expressvpn = "${{ steps.cfg.outputs.do_evpn }}"
-            }
-          } | ConvertTo-Json -Depth 5
-
-          Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
-            -Headers @{ Authorization = "Bearer $token"; Accept="application/vnd.github+json" } `
-            -Body $body
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (Test-Path $exe) { & $exe logout 2>&1 | Out-Null }
+          exit 0

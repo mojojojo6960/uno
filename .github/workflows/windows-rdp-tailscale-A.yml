@@ -189,6 +189,31 @@ jobs:
           Write-Host "  User    : $($env:RDP_USER)   (password = RDP_PASS secret)"
           Write-Host '=============================='
 
+      - name: RDP fix + diagnostics
+        run: |
+          # make sure the service and port setup are right
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name PortNumber -Value 3389
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
+          Start-Sleep 5
+
+          # explicit allow rule on the Tailscale interface only
+          Get-NetFirewallRule -DisplayName 'RDP Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'RDP Tailscale' -Direction Inbound -Protocol TCP -LocalPort 3389 `
+            -Action Allow -Profile Any -InterfaceAlias 'Tailscale' | Out-Null
+          # drop the address restriction on the built-in rules
+          Set-NetFirewallRule -DisplayGroup 'Remote Desktop' -RemoteAddress Any -Profile Any
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          '--- TermService : ' + (Get-Service TermService).Status
+          '--- Listening   :'; netstat -ano | Select-String ':3389'
+          '--- Local test  :'; Test-NetConnection localhost -Port 3389 | Select-Object TcpTestSucceeded
+          '--- Interfaces  :'; Get-NetAdapter | Format-Table Name,Status
+          '--- FW profiles :'; Get-NetFirewallProfile | Format-Table Name,Enabled
+          '--- RDP rules   :'; Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Format-Table DisplayName,Enabled,Profile
+          '--- User        :'; net user $env:RDP_USER
+
       # -----------------------------------------------------------------------
       # 4. ExpressVPN (optional; failure here never breaks the chain)
       # -----------------------------------------------------------------------

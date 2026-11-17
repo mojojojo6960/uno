@@ -1,20 +1,28 @@
 # =============================================================================
-# Windows RDP via Tailscale (self-chaining)
+# Windows RDP via Tailscale (self-chaining)  -  v2
 # -----------------------------------------------------------------------------
 # One file, no A/B pair. Each run ends ~345 min after it starts and dispatches
 # the same workflow again, so a fresh runner takes over (about 5 min gap).
 #
 # REQUIRED repository secrets  (Settings > Secrets and variables > Actions):
-#   TS_AUTHKEY   Tailscale auth key (reusable + ephemeral recommended)
-#   TS_API_KEY   Tailscale API key  (used only to remove the stale device that
-#                holds the hostname, so the hostname stays the same each run)
-#   RDP_PASS     Password for the RDP user (Windows complexity rules apply)
+#   TS_AUTHKEY   Tailscale auth key (reusable; ephemeral recommended)
+#   TS_API_KEY   Tailscale API key  (only used to remove the stale device that
+#                holds the hostname, so the hostname stays "bullet")
+#   RDP_PASS     Password for the RDP user
 #
-# No GitHub PAT is needed: the built-in GITHUB_TOKEN may trigger workflow_dispatch
-# on its own repository when the job has `actions: write`.
+# OPTIONAL secret:
+#   GH_PAT       Classic PAT (repo + workflow). Only needed if dispatching the
+#                next run with the built-in token ever fails.
 #
-# Stop the chain: Actions tab > cancel the running job AND the pending one,
-# or start it once with loops = 1.
+# Order matters: ExpressVPN is installed BEFORE Tailscale comes up, because its
+# installer resets the network stack and would otherwise drop Tailscale.
+#
+# Connect with:  Tailscale ON on your device -> RDP to the IP printed in the
+# "Tailscale up" step, or to the name  bullet  (MagicDNS).  The IP changes on
+# every run; the name does not.
+#
+# Stop the chain: cancel the running job AND the pending one, or start it with
+# loops = 1.
 # =============================================================================
 
 name: Windows RDP via Tailscale
@@ -46,7 +54,7 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write # needed to dispatch the next run with GITHUB_TOKEN
+  actions: write # needed to dispatch the next run
 
 defaults:
   run:
@@ -65,8 +73,7 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Validate secrets + resolve inputs (inputs go through env, never
-      #    interpolated into the script body)
+      # 1. Validate secrets + resolve inputs
       # -----------------------------------------------------------------------
       - name: Resolve settings
         id: cfg
@@ -92,18 +99,17 @@ jobs:
           if ($runtime -gt 350) { $runtime = 350 }   # leave room before the 360-min cap
 
           $loops = ToIntOr $env:RAW_LOOPS 0
-
           $start = [DateTime]::UtcNow.ToString('o')
 
-          "runtime=$runtime"                         | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
-          "loops=$loops"                             | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
-          "test=$($isTest.ToString().ToLower())"     | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
-          "evpn=$($doEvpn.ToString().ToLower())"     | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
-          "start=$start"                             | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "runtime=$runtime"                     | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "loops=$loops"                         | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "test=$($isTest.ToString().ToLower())" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "evpn=$($doEvpn.ToString().ToLower())" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "start=$start"                         | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
           Write-Host "runtime=$runtime min, loops=$loops, test=$isTest, expressvpn=$doEvpn"
 
       # -----------------------------------------------------------------------
-      # 2. RDP user + service + firewall (RDP reachable only from the tailnet)
+      # 2. RDP user + service
       # -----------------------------------------------------------------------
       - name: Enable RDP
         run: |
@@ -121,16 +127,15 @@ jobs:
           }
 
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name PortNumber -Value 3389
           Set-Service TermService -StartupType Automatic
-          Start-Service TermService -ErrorAction SilentlyContinue
-
+          Restart-Service TermService -Force
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          Set-NetFirewallRule -DisplayGroup 'Remote Desktop' -Profile Any `
-            -RemoteAddress '100.64.0.0/10','fd7a:115c:a1e0::/48'
-          Write-Host "RDP enabled for $u (tailnet addresses only)"
+          Set-NetFirewallRule -DisplayGroup 'Remote Desktop' -Profile Any -RemoteAddress Any
+          Write-Host "RDP enabled for $u"
 
       # -----------------------------------------------------------------------
-      # 3. Tailscale
+      # 3. Install Tailscale (do not start it yet)
       # -----------------------------------------------------------------------
       - name: Install Tailscale
         run: |
@@ -142,6 +147,58 @@ jobs:
           }
           for ($i = 0; $i -lt 30 -and -not (Test-Path $exe); $i++) { Start-Sleep 2 }
           if (-not (Test-Path $exe)) { throw 'Tailscale did not install' }
+          & $exe version
+
+      # -----------------------------------------------------------------------
+      # 4. ExpressVPN BEFORE Tailscale comes up (its installer resets the
+      #    network stack). Failure here never breaks the chain.
+      # -----------------------------------------------------------------------
+      - name: Install winget
+        if: ${{ steps.cfg.outputs.evpn == 'true' }}
+        continue-on-error: true
+        uses: Cyberboss/install-winget@v1
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Install ExpressVPN
+        if: ${{ steps.cfg.outputs.evpn == 'true' }}
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Write-Warning 'winget not available'; exit 0 }
+
+          winget install --id ExpressVPN.ExpressVPN --exact --source winget --silent `
+            --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) { Write-Warning "winget exit code: $LASTEXITCODE" }
+          Start-Sleep 30
+
+          $exe = @(
+            'C:\Program Files\ExpressVPN\expressvpn-ui\ExpressVPN.exe',
+            'C:\Program Files (x86)\ExpressVPN\expressvpn-ui\ExpressVPN.exe',
+            'C:\Program Files\ExpressVPN\ExpressVPN.exe',
+            'C:\Program Files (x86)\ExpressVPN\ExpressVPN.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if ($exe) {
+            $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:PUBLIC\Desktop\ExpressVPN.lnk")
+            $lnk.TargetPath = $exe
+            $lnk.Save()
+            Write-Host "ExpressVPN installed: $exe (desktop shortcut created, log in over RDP)"
+          } else {
+            Write-Warning 'ExpressVPN executable not found after install'
+          }
+
+          # let the network stack settle before Tailscale starts
+          Start-Sleep 20
+          Write-Host 'Network settle wait done'
+
+      # -----------------------------------------------------------------------
+      # 5. Tailscale up
+      # -----------------------------------------------------------------------
+      - name: Tailscale up
+        id: up
+        run: |
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
 
           for ($i = 0; $i -lt 30; $i++) {
             $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
@@ -149,12 +206,6 @@ jobs:
             Start-Service Tailscale -ErrorAction SilentlyContinue
             Start-Sleep 2
           }
-          & $exe version
-
-      - name: Tailscale up
-        id: up
-        run: |
-          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
 
           # Remove a stale device that still owns the hostname (previous run),
           # otherwise this one would become "bullet-1".
@@ -174,7 +225,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "tailscale up failed ($LASTEXITCODE)" }
 
           $ip4 = $null
-          for ($i = 0; $i -lt 20 -and -not $ip4; $i++) {
+          for ($i = 0; $i -lt 30 -and -not $ip4; $i++) {
             $ip4 = (& $exe ip -4 2>$null | Select-Object -First 1)
             if (-not $ip4) { Start-Sleep 1 }
           }
@@ -185,77 +236,28 @@ jobs:
           Write-Host '=============================='
           Write-Host '  RDP READY'
           Write-Host "  Address : ${ip4}:3389"
-          Write-Host "  FQDN    : $($self.DNSName)"
+          Write-Host "  Name    : $($self.DNSName)"
           Write-Host "  User    : $($env:RDP_USER)   (password = RDP_PASS secret)"
           Write-Host '=============================='
 
-      - name: RDP fix + diagnostics
+      # -----------------------------------------------------------------------
+      # 6. Allow RDP on the Tailscale interface + print diagnostics
+      # -----------------------------------------------------------------------
+      - name: RDP firewall + diagnostics
+        continue-on-error: true
         run: |
-          # make sure the service and port setup are right
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name PortNumber -Value 3389
-          Set-Service TermService -StartupType Automatic
-          Restart-Service TermService -Force
-          Start-Sleep 5
-
-          # explicit allow rule on the Tailscale interface only
           Get-NetFirewallRule -DisplayName 'RDP Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
           New-NetFirewallRule -DisplayName 'RDP Tailscale' -Direction Inbound -Protocol TCP -LocalPort 3389 `
             -Action Allow -Profile Any -InterfaceAlias 'Tailscale' | Out-Null
-          # drop the address restriction on the built-in rules
-          Set-NetFirewallRule -DisplayGroup 'Remote Desktop' -RemoteAddress Any -Profile Any
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
           '--- TermService : ' + (Get-Service TermService).Status
           '--- Listening   :'; netstat -ano | Select-String ':3389'
           '--- Local test  :'; Test-NetConnection localhost -Port 3389 | Select-Object TcpTestSucceeded
-          '--- Interfaces  :'; Get-NetAdapter | Format-Table Name,Status
-          '--- FW profiles :'; Get-NetFirewallProfile | Format-Table Name,Enabled
-          '--- RDP rules   :'; Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Format-Table DisplayName,Enabled,Profile
-          '--- User        :'; net user $env:RDP_USER
+          '--- Adapters    :'; Get-NetAdapter | Format-Table Name,Status
+          '--- Tailscale   :'; & 'C:\Program Files\Tailscale\tailscale.exe' status
 
       # -----------------------------------------------------------------------
-      # 4. ExpressVPN (optional; failure here never breaks the chain)
-      # -----------------------------------------------------------------------
-      - name: Install winget
-        if: ${{ steps.cfg.outputs.evpn == 'true' }}
-        continue-on-error: true
-        uses: Cyberboss/install-winget@v1
-        with:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Install ExpressVPN
-        if: ${{ steps.cfg.outputs.evpn == 'true' }}
-        continue-on-error: true
-        run: |
-          $ErrorActionPreference = 'Continue'
-          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Write-Warning 'winget not available'; exit 0 }
-
-          winget install --id ExpressVPN.ExpressVPN --exact --source winget --silent `
-            --accept-package-agreements --accept-source-agreements
-          if ($LASTEXITCODE -ne 0) { Write-Warning "winget exit code: $LASTEXITCODE" }
-          Start-Sleep 20
-
-          $exe = @(
-            'C:\Program Files\ExpressVPN\expressvpn-ui\ExpressVPN.exe',
-            'C:\Program Files (x86)\ExpressVPN\expressvpn-ui\ExpressVPN.exe',
-            'C:\Program Files\ExpressVPN\ExpressVPN.exe',
-            'C:\Program Files (x86)\ExpressVPN\ExpressVPN.exe'
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-          if ($exe) {
-            $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:PUBLIC\Desktop\ExpressVPN.lnk")
-            $lnk.TargetPath = $exe
-            $lnk.Save()
-            Write-Host "ExpressVPN installed: $exe (desktop shortcut created, log in over RDP)"
-          } else {
-            Write-Warning 'ExpressVPN executable not found after install'
-          }
-          # Note: do NOT connect the VPN on the runner before you are in RDP -
-          # a full-tunnel VPN can cut the Tailscale/runner connection.
-
-      # -----------------------------------------------------------------------
-      # 5. Keep alive until (job start + runtime), so setup time is included
+      # 7. Keep alive until (job start + runtime), with a Tailscale watchdog
       # -----------------------------------------------------------------------
       - name: Keep alive
         id: keep
@@ -272,24 +274,37 @@ jobs:
             $end   = $start.AddMinutes([int]$env:RUNTIME)
           }
           Write-Host "Keep alive until $($end.ToString('u'))"
+
           $i = 0
           while ([DateTime]::UtcNow -lt $end) {
-            Start-Sleep -Seconds ([Math]::Min(300, [Math]::Max(1, [int]($end - [DateTime]::UtcNow).TotalSeconds)))
+            Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, [int]($end - [DateTime]::UtcNow).TotalSeconds)))
             $i++
-            $left = [int]($end - [DateTime]::UtcNow).TotalMinutes
-            $ok   = (& $exe status 2>&1 | Out-String) -notmatch 'Logged out|Stopped'
-            Write-Host "[heartbeat $i] $left min left, tailscale ok=$ok"
+            try {
+              $ip = (& $exe ip -4 2>$null | Select-Object -First 1)
+              if (-not $ip) {
+                Write-Warning 'Tailscale is down - reconnecting'
+                Start-Service Tailscale -ErrorAction SilentlyContinue
+                & $exe up --authkey="$env:TS_AUTHKEY" --hostname="$env:TS_HOSTNAME" --accept-routes --accept-dns=false --unattended
+                $ip = (& $exe ip -4 2>$null | Select-Object -First 1)
+                Write-Host "Reconnected, ip=$ip"
+              }
+            } catch {
+              Write-Warning "watchdog error: $($_.Exception.Message)"
+            }
+            if ($i % 5 -eq 0) {
+              $left = [int]($end - [DateTime]::UtcNow).TotalMinutes
+              Write-Host "[heartbeat] $left min left, tailscale ip=$ip"
+            }
           }
           Write-Host 'Keep alive finished.'
 
       # -----------------------------------------------------------------------
-      # 6. Hand off to the next run - ONLY when keep-alive completed normally.
-      #    (No `always()`: a failed or cancelled run does not respawn itself.)
+      # 8. Hand off to the next run - ONLY when keep-alive completed normally
       # -----------------------------------------------------------------------
       - name: Dispatch next run
         if: ${{ success() && steps.keep.outcome == 'success' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
           WF_REF: ${{ github.workflow_ref }}
           REF_NAME: ${{ github.ref_name }}
           LOOPS: ${{ steps.cfg.outputs.loops }}
@@ -314,7 +329,7 @@ jobs:
           if (-not $done) { throw 'Could not dispatch the next run' }
 
       # -----------------------------------------------------------------------
-      # 7. Release the tailnet device so the next run can reuse the hostname
+      # 9. Release the tailnet device so the next run can reuse the hostname
       # -----------------------------------------------------------------------
       - name: Tailscale logout
         if: always()
